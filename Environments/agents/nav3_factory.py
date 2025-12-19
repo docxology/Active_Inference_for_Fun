@@ -1,19 +1,33 @@
-# ai_agent_factory_nav3.py
-import numpy as np
+"""
+Active Inference agent factory for oriented tri-modal grid environments.
+
+This module provides functions to construct Active Inference agents
+for environments with position, orientation, and multi-modal observations.
+"""
+
+import logging
 from typing import Tuple, Optional, Dict, Any
+
+import numpy as np
 
 try:
     from pymdp.agent import Agent
-except Exception:
-    # Older pymdp
-    from pymdp.agent import Agent as Agent
+except ImportError:
+    raise ImportError("pymdp package required for Active Inference agents")
 
+logger = logging.getLogger(__name__)
+
+# Orientation constants
 ORIENTS = ["N", "E", "S", "W"]
-ORI2IDX = {o:i for i,o in enumerate(ORIENTS)}
+ORI2IDX = {o: i for i, o in enumerate(ORIENTS)}
 
+# Cell class constants
 CLASS_EMPTY, CLASS_EDGE, CLASS_RED, CLASS_GREEN = 0, 1, 2, 3
-M2_EDGE, M2_RED, M2_GREEN = 0, 1, 2  # terminal class in look direction
 
+# Terminal class mappings for modality 2
+M2_EDGE, M2_RED, M2_GREEN = 0, 1, 2
+
+# Action constants
 FWD = 0
 TURN_L = 1
 TURN_R = 2
@@ -231,21 +245,71 @@ def _to_obj_array(*arrays: np.ndarray) -> np.ndarray:
 
 
 def build_trimodal_nav_agent(
-    n_rows:int, n_cols:int,
-    reward_pos:Tuple[int,int], punish_pos:Tuple[int,int],
-    start_pos:Optional[Tuple[int,int]] = None,
-    start_ori:str = "N",
-    a_obs_noise:float = 0.0,
-    b_model_noise:float = 0.0,
-    policy_len:int = 4, gamma:float = 16.0,
-    action_selection:str = "stochastic",
-    c_green:float = 3.0, c_red:float = -3.0,
-    sophisticated:bool = False,
-) -> Tuple[Any, Dict[str,Any], Dict[str,Any]]:
+    n_rows: int,
+    n_cols: int,
+    reward_pos: Tuple[int, int],
+    punish_pos: Tuple[int, int],
+    start_pos: Optional[Tuple[int, int]] = None,
+    start_ori: str = "N",
+    a_obs_noise: float = 0.0,
+    b_model_noise: float = 0.0,
+    policy_len: int = 4,
+    gamma: float = 16.0,
+    action_selection: str = "stochastic",
+    c_green: float = 3.0,
+    c_red: float = -3.0,
+    sophisticated: bool = False,
+) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
     """
-    Build a tri-modal navigation agent with a single joint hidden factor (pos×ori).
-    Returns (agent, model_dict, controls) where controls includes a safe 'infer_policies' shim.
+    Build a tri-modal navigation agent for oriented grid environments.
+
+    Constructs an Active Inference agent for environments with position,
+    orientation, and three observation modalities: distance to terminal,
+    terminal type, and current cell type.
+
+    Args:
+        n_rows: Number of grid rows
+        n_cols: Number of grid columns
+        reward_pos: (row, col) position of reward terminal
+        punish_pos: (row, col) position of punish terminal
+        start_pos: (row, col) starting position, or None for uniform prior
+        start_ori: Starting orientation ("N", "E", "S", "W")
+        a_obs_noise: Observation noise for A matrices (0.0 = deterministic)
+        b_model_noise: Model uncertainty for B matrix (0.0 = deterministic)
+        policy_len: Planning horizon length
+        gamma: Policy precision parameter
+        action_selection: Action selection method ("stochastic" or "deterministic")
+        c_green: Preference strength for green/reward observations
+        c_red: Preference strength for red/punish observations
+        sophisticated: Whether to use sophisticated inference if available
+
+    Returns:
+        Tuple of (agent, model, controls) where:
+        - agent: pymdp Agent instance
+        - model: Dict with generative model components and metadata
+        - controls: Dict with policy inference wrapper
+
+    Raises:
+        ValueError: If grid dimensions or positions are invalid
     """
+    # Validate inputs
+    if n_rows < 2 or n_cols < 2:
+        raise ValueError("Grid must be at least 2×2 for meaningful navigation")
+
+    if not (0 <= reward_pos[0] < n_rows and 0 <= reward_pos[1] < n_cols):
+        raise ValueError(f"Reward position {reward_pos} out of bounds for {n_rows}×{n_cols} grid")
+
+    if not (0 <= punish_pos[0] < n_rows and 0 <= punish_pos[1] < n_cols):
+        raise ValueError(f"Punish position {punish_pos} out of bounds for {n_rows}×{n_cols} grid")
+
+    if start_ori not in ORIENTS:
+        raise ValueError(f"Invalid start orientation '{start_ori}', must be one of {ORIENTS}")
+
+    logger.info(
+        f"Building tri-modal navigation agent: {n_rows}×{n_cols} grid, "
+        f"reward={reward_pos}, punish={punish_pos}, start_pos={start_pos}, "
+        f"start_ori={start_ori}, obs_noise={a_obs_noise}, model_noise={b_model_noise}"
+    )
     # A (three modalities)
     A1, A2, A3 = _build_A(n_rows, n_cols, reward_pos, punish_pos, a_obs_noise=a_obs_noise)
     A = _to_obj_array(A1, A2, A3)

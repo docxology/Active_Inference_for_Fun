@@ -1,67 +1,88 @@
 """
-A minimal N x M GridWorld for Gymnasium.
+GridWorld Environment for Active Inference.
 
-- Discrete actions: 0=UP, 1=RIGHT, 2=DOWN, 3=LEFT
-- Observation: single Discrete index in [0, N*M-1] representing the agent's cell
-- Two terminal special cells:
-    * reward_pos -> terminal with positive reward
-    * punish_pos -> terminal with negative reward
-- All other cells are neutral. Optional step_cost can be used to encourage shorter paths.
+A simple N×M grid world environment with discrete actions and observations.
+The environment contains two terminal cells: one rewarding and one punishing.
+All other cells are neutral with optional step costs.
 
-This environment is intentionally simple and deterministic by default.
-It will be used as the base case for Active Inference examples with `pymdp`.
+Actions (discrete):
+    0 = UP, 1 = RIGHT, 2 = DOWN, 3 = LEFT
 
-Usage example:
+Observations:
+    Single discrete index [0, N×M-1] representing the agent's cell position.
 
-    import gymnasium as gym
-    from gridworld_env import GridWorld
+Terminal states:
+    - reward_pos: terminates with positive reward
+    - punish_pos: terminates with negative reward
 
-    env = GridWorld(n_rows=4, n_cols=5,
-                    reward_pos=(3, 4), punish_pos=(0, 4),
-                    start_pos=(0, 0), step_cost=0.0,
-                    reward=1.0, punish=-1.0, max_steps=100)
+Features:
+    - Deterministic dynamics by default
+    - Optional action stochasticity (slip_prob)
+    - Optional per-step costs
+    - Multiple rendering modes (text, graphical, RGB array)
 
-    obs, info = env.reset(seed=42)
-    done = False
-    total = 0.0
-    while not done:
-        action = env.action_space.sample()
-        obs, r, terminated, truncated, info = env.step(action)
-        total += r
-        done = terminated or truncated
-        # print(env.render())  # uncomment to see a text board
-    print("Return:", total)
-
+Example:
+    >>> import gymnasium as gym
+    >>> from active_inference.environments.core import GridWorld
+    >>>
+    >>> env = GridWorld(
+    ...     n_rows=4, n_cols=5,
+    ...     reward_pos=(3, 4), punish_pos=(0, 4),
+    ...     start_pos=(0, 0), step_cost=0.0,
+    ...     reward=1.0, punish=-1.0, max_steps=100
+    ... )
+    >>>
+    >>> obs, info = env.reset(seed=42)
+    >>> done = False
+    >>> total = 0.0
+    >>> while not done:
+    ...     action = env.action_space.sample()
+    ...     obs, r, terminated, truncated, info = env.step(action)
+    ...     total += r
+    ...     done = terminated or truncated
+    >>> print(f"Return: {total}")
 """
 
-from __future__ import annotations
+import logging
 from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
+logger = logging.getLogger(__name__)
 
 Action = int
 Pos = Tuple[int, int]
 
 
 class GridWorld(gym.Env):
-    """A tiny, deterministic grid world with one rewarding and one punishing cell.
+    """
+    Grid world environment with rewarding and punishing terminal states.
+
+    The agent navigates a grid using discrete actions. Reaching the reward
+    position terminates the episode with positive reward. Reaching the punish
+    position terminates with negative reward. All other cells are neutral.
 
     Args:
-        n_rows: number of grid rows (N)
-        n_cols: number of grid columns (M)
-        reward_pos: (row, col) of the rewarding terminal cell
-        punish_pos: (row, col) of the punishing terminal cell
-        start_pos: starting (row, col) for the agent. If None, a random non-terminal cell is used at reset.
-        step_cost: per-step reward added every step (usually <= 0 to encourage shorter paths)
-        reward: terminal reward when reaching reward_pos
-        punish: terminal reward when reaching punish_pos (typically negative)
-        max_steps: optional episode length cap (for truncation). If None, defaults to 5*(N*M)
-        slip_prob: probability of ignoring the chosen action and sampling a random action instead (stochasticity)
-        render_mode: "ansi" to get a string board; None disables rendering
+        n_rows: Number of grid rows
+        n_cols: Number of grid columns
+        reward_pos: (row, col) position of rewarding terminal cell
+        punish_pos: (row, col) position of punishing terminal cell
+        start_pos: Starting (row, col) position. If None, random non-terminal cell at reset
+        step_cost: Reward penalty per step (negative values encourage shorter paths)
+        reward: Terminal reward for reaching reward_pos
+        punish: Terminal reward for reaching punish_pos (typically negative)
+        max_steps: Maximum episode length. If None, defaults to 5×(N×M)
+        slip_prob: Probability of random action instead of chosen action
+        render_mode: Rendering mode - "ansi" for text, "human" for GUI, "rgb_array" for image
+
+    Attributes:
+        action_space: Discrete(4) - actions 0=UP, 1=RIGHT, 2=DOWN, 3=LEFT
+        observation_space: Discrete(N×M) - cell indices from 0 to N×M-1
     """
+
+    metadata = {"render_modes": ["ansi", "human", "rgb_array"], "render_fps": 4}
 
     metadata = {"render_modes": ["ansi"], "render_fps": 4}
 
@@ -81,11 +102,18 @@ class GridWorld(gym.Env):
     ) -> None:
         super().__init__()
 
-        assert n_rows >= 2 and n_cols >= 2, "Use at least a 2x2 grid for meaningful dynamics."
+        if n_rows < 2 or n_cols < 2:
+            raise ValueError("Grid must be at least 2×2 for meaningful dynamics")
+
         self.n_rows = int(n_rows)
         self.n_cols = int(n_cols)
         self.reward_pos = self._validate_pos(reward_pos)
         self.punish_pos = self._validate_pos(punish_pos)
+
+        # Validate positions are different
+        if self.reward_pos == self.punish_pos:
+            raise ValueError("Reward and punish positions must be different")
+
         self.start_pos_cfg = None if start_pos is None else self._validate_pos(start_pos)
         self.step_cost = float(step_cost)
         self.r_reward = float(reward)
@@ -107,6 +135,12 @@ class GridWorld(gym.Env):
         self._reward_idx = self._pos_to_idx(self.reward_pos)
         self._punish_idx = self._pos_to_idx(self.punish_pos)
 
+        logger.info(
+            f"Created {n_rows}×{n_cols} GridWorld: "
+            f"reward={self.reward_pos}, punish={self.punish_pos}, "
+            f"start={self.start_pos_cfg}, slip_prob={slip_prob}"
+        )
+
     # ------------------------- Gymnasium core API ------------------------- #
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
@@ -117,24 +151,34 @@ class GridWorld(gym.Env):
         # Pick start position
         if self.start_pos_cfg is not None:
             self.pos = self.start_pos_cfg
+            logger.debug(f"Reset to configured start position: {self.pos}")
         else:
             # Uniform over non-terminal positions
             all_idxs = [i for i in range(self.n_rows * self.n_cols) if i not in (self._reward_idx, self._punish_idx)]
             start_idx = self._rng.choice(all_idxs)
             self.pos = self._idx_to_pos(int(start_idx))
+            logger.debug(f"Reset to random start position: {self.pos}")
 
         self._steps = 0
         obs = self._pos_to_idx(self.pos)
         info = {"pos": self.pos}
+
+        logger.info(f"Environment reset to position {self.pos}")
         return obs, info
 
     def step(self, action: Action):
+        if not self.action_space.contains(action):
+            raise ValueError(f"Invalid action {action}, must be in {self.action_space}")
+
         self._steps += 1
+        original_action = action
 
         # Slip/stochastic action override
         if self.slip_prob > 0.0 and self._rng.random() < self.slip_prob:
             action = int(self._rng.integers(0, 4))
+            logger.debug(f"Action slipped from {original_action} to {action}")
 
+        # Execute action
         r, c = self.pos
         if action == 0:  # UP
             r = max(0, r - 1)
@@ -144,25 +188,29 @@ class GridWorld(gym.Env):
             r = min(self.n_rows - 1, r + 1)
         elif action == 3:  # LEFT
             c = max(0, c - 1)
-        else:
-            raise ValueError("Invalid action")
 
+        old_pos = self.pos
         self.pos = (r, c)
         idx = self._pos_to_idx(self.pos)
 
-        # Base step reward (could be negative to encourage shorter paths)
+        # Base step reward
         reward = self.step_cost
         terminated = False
 
+        # Check terminal conditions
         if idx == self._reward_idx:
             reward += self.r_reward
             terminated = True
+            logger.debug(f"Reached reward at {self.pos}, reward: {reward}")
         elif idx == self._punish_idx:
             reward += self.r_punish
             terminated = True
+            logger.debug(f"Reached punish at {self.pos}, reward: {reward}")
 
         truncated = self._steps >= self.max_steps
         info = {"pos": self.pos}
+
+        logger.debug(f"Step {self._steps}: {old_pos} -> {self.pos} (action {original_action}), reward: {reward}")
         return idx, float(reward), bool(terminated), bool(truncated), info
 
     def render(self):

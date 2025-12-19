@@ -1,34 +1,82 @@
-# oriented_trimodal_grid.py
-from __future__ import annotations
-import numpy as np
+"""
+Oriented Tri-Modal Grid Environment for Active Inference.
+
+A grid world environment with agent orientation and three observation modalities:
+- M1: Distance to first terminal cell along look direction
+- M2: Terminal class along look direction (EDGE/RED/GREEN)
+- M3: Current cell class (EMPTY/EDGE/RED/GREEN)
+
+The agent can move forward or rotate in place. Empty cells are transparent
+for distance calculations. Termination occurs on entering reward/punish cells.
+
+Example:
+    >>> from active_inference.environments.core import OrientedTriModalGrid
+    >>>
+    >>> env = OrientedTriModalGrid(
+    ...     n_rows=6, n_cols=6,
+    ...     reward_pos=(5, 5), punish_pos=(0, 5),
+    ...     start_pos=(0, 0), start_ori="N"
+    ... )
+    >>>
+    >>> obs, info = env.reset()
+    >>> # obs is (distance, terminal_class, current_class)
+"""
+
+import logging
 from typing import Optional, Tuple, Dict, Any
+
+import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# --- Classes / orientations (must match your agent factory) ---
+logger = logging.getLogger(__name__)
+
+# Cell classes
 CLASS_EMPTY, CLASS_EDGE, CLASS_RED, CLASS_GREEN = 0, 1, 2, 3
+
+# Terminal class mappings for modality 2
 M2_EDGE, M2_RED, M2_GREEN = 0, 1, 2
 
+# Orientations
 ORIENTS = ["N", "E", "S", "W"]
 ORI2IDX = {o: i for i, o in enumerate(ORIENTS)}
 
-# Actions (Discrete(3))
+# Actions
 FWD, TURN_L, TURN_R = 0, 1, 2
 
 
 class OrientedTriModalGrid(gym.Env):
     """
-    Gridworld with orientation and tri-modal observations:
-      - M1: distance to first terminal along look direction (EDGE/RED/GREEN); empty cells are transparent.
-      - M2: terminal class along look direction ∈ {EDGE=0, RED=1, GREEN=2}
-      - M3: current cell class ∈ {EMPTY=0, EDGE=1, RED=2, GREEN=3}
+    Grid world with agent orientation and tri-modal observations.
 
-    Hidden state is (row, col, orientation). Dynamics are deterministic:
-      - forward: move one cell in the look direction (clamped at borders)
-      - turn_left / turn_right: rotate in place
+    The agent has position and orientation in a grid world. Observations include:
+    - Distance to first terminal cell along current look direction
+    - Type of terminal cell along look direction (EDGE/RED/GREEN)
+    - Type of current cell (EMPTY/EDGE/RED/GREEN)
 
-    Termination on entering GREEN (+reward) or RED (punish), or hitting max_steps.
+    Actions are: forward movement, left turn, right turn. Empty cells are
+    transparent for distance calculations. Episode terminates on entering
+    reward/punish cells or reaching max_steps.
+
+    Args:
+        n_rows: Number of grid rows
+        n_cols: Number of grid columns
+        reward_pos: (row, col) position of reward terminal
+        punish_pos: (row, col) position of punish terminal
+        start_pos: Starting (row, col) position
+        start_ori: Starting orientation ("N", "E", "S", "W")
+        step_cost: Reward penalty per step
+        reward: Terminal reward for reaching reward_pos
+        punish: Terminal reward for reaching punish_pos
+        max_steps: Maximum episode length
+        render_mode: Rendering mode ("human" or "rgb_array")
+        cell_px: Pixel size per cell for rendering
+
+    Attributes:
+        action_space: Discrete(3) - actions 0=FWD, 1=TURN_L, 2=TURN_R
+        observation_space: Tuple of three Discrete spaces for tri-modal observations
     """
+
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 12}
 
     def __init__(
@@ -47,12 +95,30 @@ class OrientedTriModalGrid(gym.Env):
         cell_px: int = 28,
     ):
         super().__init__()
-        assert n_rows >= 2 and n_cols >= 2, "Need at least 2x2 grid."
+
+        if n_rows < 2 or n_cols < 2:
+            raise ValueError("Grid must be at least 2×2 for meaningful dynamics")
+
         self.n_rows = n_rows
         self.n_cols = n_cols
         self.reward_pos = tuple(reward_pos)
         self.punish_pos = tuple(punish_pos)
+
+        # Validate positions are different and within bounds
+        if self.reward_pos == self.punish_pos:
+            raise ValueError("Reward and punish positions must be different")
+        if not (0 <= self.reward_pos[0] < n_rows and 0 <= self.reward_pos[1] < n_cols):
+            raise ValueError(f"Reward position {self.reward_pos} out of bounds for {n_rows}×{n_cols} grid")
+        if not (0 <= self.punish_pos[0] < n_rows and 0 <= self.punish_pos[1] < n_cols):
+            raise ValueError(f"Punish position {self.punish_pos} out of bounds for {n_rows}×{n_cols} grid")
+
         self.start_pos = None if start_pos is None else tuple(start_pos)
+        if self.start_pos and not (0 <= self.start_pos[0] < n_rows and 0 <= self.start_pos[1] < n_cols):
+            raise ValueError(f"Start position {self.start_pos} out of bounds for {n_rows}×{n_cols} grid")
+
+        if start_ori.upper() not in ORI2IDX:
+            raise ValueError(f"Invalid start orientation '{start_ori}', must be one of {ORIENTS}")
+
         self.start_ori = start_ori.upper()
         self.step_cost = float(step_cost)
         self.reward_val = float(reward)
@@ -64,9 +130,9 @@ class OrientedTriModalGrid(gym.Env):
         # Spaces
         max_range = max(n_rows, n_cols) - 1
         self.observation_space = spaces.Tuple((
-            spaces.Discrete(max_range + 1, start=0),   # M1 distance
-            spaces.Discrete(3),                        # M2 terminal class: EDGE/RED/GREEN
-            spaces.Discrete(4),                        # M3 current class: EMPTY/EDGE/RED/GREEN
+            spaces.Discrete(max_range + 1, start=0),   # M1: distance to terminal
+            spaces.Discrete(3),                        # M2: terminal class (EDGE/RED/GREEN)
+            spaces.Discrete(4),                        # M3: current class (EMPTY/EDGE/RED/GREEN)
         ))
         self.action_space = spaces.Discrete(3)
 
@@ -79,40 +145,60 @@ class OrientedTriModalGrid(gym.Env):
         self._fig = None
         self._ax = None
         self._im = None
-        self._bg = None  # background image without the agent (for fast blitting)
+        self._bg = None
 
-        # Precompute static board background (classes that do not change)
+        # Precompute static board background
         self._board_rgb = None
         self._rebuild_board_rgb()
+
+        logger.info(
+            f"Created {n_rows}×{n_cols} OrientedTriModalGrid: "
+            f"reward={self.reward_pos}, punish={self.punish_pos}, "
+            f"start_pos={self.start_pos}, start_ori={self.start_ori}"
+        )
 
     # -------- Gym API --------
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         super().reset(seed=seed)
         if self.start_pos is None:
-            # random start anywhere
+            # Random start anywhere
             r = self.np_random.integers(0, self.n_rows)
             c = self.np_random.integers(0, self.n_cols)
             self.pos = (int(r), int(c))
+            logger.debug(f"Reset to random position: {self.pos}")
         else:
             self.pos = tuple(self.start_pos)
+            logger.debug(f"Reset to configured position: {self.pos}")
+
         self.ori = ORI2IDX.get(self.start_ori, 0)
         self.steps = 0
         obs = self._get_obs()
         info = {}
+
+        logger.info(f"Environment reset: pos={self.pos}, ori={ORIENTS[self.ori]}")
         return obs, info
 
     def step(self, action: int):
+        if not self.action_space.contains(action):
+            raise ValueError(f"Invalid action {action}, must be in {self.action_space}")
+
         action = int(action)
         self.steps += 1
 
+        old_pos = self.pos
+        old_ori = self.ori
+
         if action == FWD:
             self.pos = self._forward(self.pos, self.ori)
+            action_name = "forward"
         elif action == TURN_L:
             self.ori = (self.ori - 1) % 4
+            action_name = "turn_left"
         elif action == TURN_R:
             self.ori = (self.ori + 1) % 4
+            action_name = "turn_right"
         else:
-            raise ValueError("Invalid action")
+            raise ValueError(f"Invalid action {action}")
 
         r = self.step_cost
         terminated = False
@@ -120,9 +206,11 @@ class OrientedTriModalGrid(gym.Env):
         if self.pos == self.reward_pos:
             r += self.reward_val
             terminated = True
+            logger.debug(f"Reached reward at {self.pos}, reward: {r}")
         elif self.pos == self.punish_pos:
             r += self.punish_val
             terminated = True
+            logger.debug(f"Reached punish at {self.pos}, reward: {r}")
 
         truncated = self.steps >= self.max_steps
         obs = self._get_obs()
@@ -131,6 +219,10 @@ class OrientedTriModalGrid(gym.Env):
         if self.render_mode == "human":
             self.render()
 
+        logger.debug(
+            f"Step {self.steps}: {old_pos}/{ORIENTS[old_ori]} -> "
+            f"{self.pos}/{ORIENTS[self.ori]} ({action_name}), reward: {r}"
+        )
         return obs, float(r), bool(terminated), bool(truncated), info
 
     # -------- Observations --------
